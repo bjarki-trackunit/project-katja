@@ -3,6 +3,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/charger.h>
+#include <zephyr/drivers/sensor.h>
 
 ZBUS_CHAN_DEFINE(
 	persevere_chan,
@@ -18,18 +19,8 @@ ZBUS_CHAN_DEFINE(
 );
 
 static const struct device *charger = DEVICE_DT_GET(DT_ALIAS(charger));
-
-static const struct gpio_dt_spec battery_measure_enable =
-	GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), battery_measure_enable_gpios);
-
-static const struct adc_dt_spec battery_measure_io_channel =
-	ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
-
-static void persevere_init(void)
-{
-	gpio_pin_configure_dt(&battery_measure_enable, GPIO_OUTPUT_ACTIVE);
-	adc_channel_setup_dt(&battery_measure_io_channel);
-}
+static const struct device *battery_voltage_sensor =
+	DEVICE_DT_GET(DT_ALIAS(battery_voltage_sensor));
 
 static int persevere_get_charger_status(struct persevere_message *message)
 {
@@ -61,38 +52,40 @@ static int persevere_get_charger_status(struct persevere_message *message)
 
 static int persevere_get_battery_voltage(struct persevere_message *message)
 {
-	uint16_t sequence_buffer;
-	struct adc_sequence sequence = {
-		.buffer = &sequence_buffer,
-		.buffer_size = sizeof(sequence_buffer),
-	};
-	int32_t mv;
+	struct sensor_value val;
 
-	if (adc_sequence_init_dt(&battery_measure_io_channel, &sequence)) {
-		return -EAGAIN;
-	}
-	if (adc_read_dt(&battery_measure_io_channel, &sequence)) {
-		return -EAGAIN;
+	if (sensor_sample_fetch(battery_voltage_sensor) < 0) {
+		return -1;
 	}
 
-	mv = (int32_t)sequence_buffer;
-	adc_raw_to_millivolts_dt(&battery_measure_io_channel, &mv);
-	if (mv < 0) {
-		return -EAGAIN;
+	if (sensor_channel_get(battery_voltage_sensor, SENSOR_CHAN_VOLTAGE, &val) < 0) {
+		return -1;
 	}
 
-	message->battery_voltage = (112328 * mv) / 65536;
+	message->battery_voltage = (val.val1 * 1000) + (val.val2 / 1000);
 	return 0;
 }
 
-
+static void persevere_get_battery_capacity(struct persevere_message *message)
+{
+	/* Follows standard Li-Ion discharge curve */
+	if (message->battery_voltage > 3900) {
+		message->battery_capacity = 100;
+	} else if (message->battery_voltage > 3700) {
+		message->battery_capacity = 80;
+	} else if (message->battery_voltage > 3650) {
+		message->battery_capacity = 40;
+	} else if (message->battery_voltage > 3500) {
+		message->battery_capacity = 20;
+	} else {
+		message->battery_capacity = 0;
+	}
+}
 
 static void persevere_routine(void)
 {
 	int ret;
 	struct persevere_message message;
-
-	persevere_init();
 
 	while (true) {
 		ret = persevere_get_charger_status(&message);
@@ -104,6 +97,8 @@ static void persevere_routine(void)
 		if (ret < 0) {
 			continue;
 		}
+
+		persevere_get_battery_capacity(&message);
 
 		zbus_chan_pub(&persevere_chan, &message, K_SECONDS(1));
 		k_msleep(1000);
