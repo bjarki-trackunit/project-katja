@@ -19,6 +19,6 @@ struct persevere_message {
 	uint16_t battery_capacity;
 };
 
-ZBUS_CHAN_DECLARE(persevere_chan);
+ZBUS_CHAN_DECLARE(persevere_channel);
 
 #endif /* KATJA_PERSEVERE_H */

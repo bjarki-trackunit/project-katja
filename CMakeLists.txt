@@ -8,8 +8,13 @@ project(katja)
 target_include_directories(app PRIVATE include)
 target_sources(app PRIVATE
   src/main.c
-  src/ambience.c
-  src/conserve.c
   src/illuminate.c
   src/persevere.c
+  src/channels.c
+  src/agility.c
+  src/rhythmic.c
+  src/epilogue.c
+  src/conserve.c
+  src/connection.c
+  src/proxy.c
   )

@@ -1,26 +1,19 @@
 #include <katja/persevere.h>
+#include <katja/conserve.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/charger.h>
 #include <zephyr/drivers/sensor.h>
 
-ZBUS_CHAN_DEFINE(
-	persevere_chan,
-	struct persevere_message,
-	NULL,
-	NULL,
-	ZBUS_OBSERVERS_EMPTY,
-	ZBUS_MSG_INIT(
-		.charger_status = PERSEVERE_CHARGER_STATUS_DISCONNECTED,
-		.battery_voltage = 0,
-		.battery_capacity = 0,
-	)
-);
+#define PERSEVERE_BATTERY_MAX_MV (4150)
+#define PERSEVERE_BATTERY_MIN_MV (3600)
+#define PERSEVERE_BATTERY_MV_RANGE (PERSEVERE_BATTERY_MAX_MV - PERSEVERE_BATTERY_MIN_MV)
+#define PERSEVERE_BATTERY_MV_PER_PERCENT (PERSEVERE_BATTERY_MV_RANGE / 100)
 
 static const struct device *charger = DEVICE_DT_GET(DT_ALIAS(charger));
-static const struct device *battery_voltage_sensor =
-	DEVICE_DT_GET(DT_ALIAS(battery_voltage_sensor));
+static const struct device *sensor = DEVICE_DT_GET(DT_ALIAS(battery_voltage_sensor));
+static bool conserve_referenced;
 
 static int persevere_get_charger_status(struct persevere_message *message)
 {
@@ -36,6 +29,7 @@ static int persevere_get_charger_status(struct persevere_message *message)
 		break;
 
 	case CHARGER_STATUS_DISCHARGING:
+	case CHARGER_STATUS_NOT_CHARGING:
 		message->charger_status = PERSEVERE_CHARGER_STATUS_DISCONNECTED;
 		break;
 
@@ -54,32 +48,70 @@ static int persevere_get_battery_voltage(struct persevere_message *message)
 {
 	struct sensor_value val;
 
-	if (sensor_sample_fetch(battery_voltage_sensor) < 0) {
+	if (message->charger_status == PERSEVERE_CHARGER_STATUS_CHARGING) {
+		charger_charge_enable(charger, false);
+		k_msleep(10);
+	}
+
+	if (sensor_sample_fetch(sensor) < 0) {
 		return -1;
 	}
 
-	if (sensor_channel_get(battery_voltage_sensor, SENSOR_CHAN_VOLTAGE, &val) < 0) {
+	if (message->charger_status == PERSEVERE_CHARGER_STATUS_CHARGING) {
+		charger_charge_enable(charger, true);
+	}
+
+	if (sensor_channel_get(sensor, SENSOR_CHAN_VOLTAGE, &val) < 0) {
 		return -1;
 	}
 
 	message->battery_voltage = (val.val1 * 1000) + (val.val2 / 1000);
+
+	if (message->battery_voltage < 2800) {
+		message->battery_voltage = 0;
+	}
+
 	return 0;
 }
 
 static void persevere_get_battery_capacity(struct persevere_message *message)
 {
-	/* Follows standard Li-Ion discharge curve */
-	if (message->battery_voltage > 3900) {
-		message->battery_capacity = 100;
-	} else if (message->battery_voltage > 3700) {
-		message->battery_capacity = 80;
-	} else if (message->battery_voltage > 3650) {
-		message->battery_capacity = 40;
-	} else if (message->battery_voltage > 3500) {
-		message->battery_capacity = 20;
-	} else {
+	if (message->battery_voltage < PERSEVERE_BATTERY_MIN_MV) {
 		message->battery_capacity = 0;
+		return;
 	}
+
+	message->battery_capacity = (message->battery_voltage - PERSEVERE_BATTERY_MIN_MV) /
+				    (PERSEVERE_BATTERY_MV_PER_PERCENT);
+
+	if (message->battery_capacity > 100) {
+		message->battery_capacity = 100;
+	}
+}
+
+static bool persevere_charger_is_connected(const struct persevere_message *message)
+{
+	return message->charger_status != PERSEVERE_CHARGER_STATUS_DISCONNECTED;
+}
+
+static void persevere_reference_conserve(void)
+{
+	if (conserve_referenced) {
+		return;
+	}
+
+	conserve_publish_reference();
+	conserve_referenced = true;
+}
+
+static void persevere_dereference_conserve(void)
+{
+	if (!conserve_referenced) {
+		return;
+	}
+
+	conserve_publish_dereference();
+	conserve_referenced = false;
 }
 
 static void persevere_routine(void)
@@ -93,6 +125,12 @@ static void persevere_routine(void)
 			continue;
 		}
 
+		if (persevere_charger_is_connected(&message)) {
+			persevere_reference_conserve();
+		} else {
+			persevere_dereference_conserve();
+		}
+
 		ret = persevere_get_battery_voltage(&message);
 		if (ret < 0) {
 			continue;
@@ -100,10 +138,8 @@ static void persevere_routine(void)
 
 		persevere_get_battery_capacity(&message);
 
-		zbus_chan_pub(&persevere_chan, &message, K_SECONDS(1));
+		zbus_chan_pub(&persevere_channel, &message, K_SECONDS(1));
 		k_msleep(1000);
-
-		printk("Battery voltage %u.%03u\n", ret / 1000, ret % 1000);
 	}
 }
 
